@@ -48,7 +48,7 @@ raw = None
 
 for encoding in encodings:
     try:
-        raw = pd.read_csv(DATA_PATH, encoding=encoding)
+        raw = pd.read_csv(DATA_PATH, encoding="cp1252")
         st.success(f"Dataset loaded using {encoding} encoding.")
         break
     except UnicodeDecodeError:
