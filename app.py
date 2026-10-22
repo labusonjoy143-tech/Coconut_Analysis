@@ -65,20 +65,17 @@ NUMERIC_HINTS = [
     "quantity", "amount", "ton", "kg", "hectare", "humidity"
 ]
 
-def read_uploaded_csv(uploaded_file):
-    """Read a user-uploaded CSV without requiring a repository dataset."""
-    errors = []
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
+def load_csv(uploaded_file):
+    encodings = ["utf-8-sig", "cp1252", "latin1"]
+
+    for encoding in encodings:
         try:
             uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, encoding=encoding, low_memory=False)
-        except UnicodeDecodeError as exc:
-            errors.append(f"{encoding}: {exc}")
-        except pd.errors.EmptyDataError:
-            raise ValueError("The CSV file is empty.")
-        except Exception as exc:
-            errors.append(f"{encoding}: {exc}")
-    raise ValueError("Could not read this CSV. Please check that it is a valid CSV file. " + " | ".join(errors[-2:]))
+            return pd.read_csv(uploaded_file, encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+
+    raise ValueError("Unable to read this CSV file.")
 
 def clean_dataset(raw, trim_text=True, remove_duplicates=True):
     data = raw.copy()
