@@ -66,7 +66,7 @@ try:
     if DATA_PATH.suffix.lower() == ".csv":
         raw = pd.read_csv(DATA_PATH)
     else:
-        raw = pd.read_excel(DATA_PATH)
+       raw = pd.read_csv(DATA_PATH, encoding="cp1252")
 
     st.success(f"Loaded dataset: {DATA_PATH.name}")
     st.write("Dataset dimensions:", raw.shape)
