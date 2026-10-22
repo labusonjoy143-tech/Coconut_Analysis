@@ -198,7 +198,8 @@ with st.sidebar.expander("Cleaning settings", expanded=False):
 page = st.sidebar.radio(
     "Dashboard navigation",
     [
-        "Overview & Data Quality",
+        "Overview",
+        "Data Cleaning",
         "Statistics & Exploration",
         "Classification & Prediction",
         "Harvest Forecasting",
@@ -246,7 +247,7 @@ if "forecast_download" not in st.session_state:
     st.session_state["forecast_download"] = None
 
 # ---------- Overview ----------
-if page == "Overview & Data Quality":
+if page == "Overview":
     st.markdown("### Dataset overview")
     a, b, c, d = st.columns(4)
     a.metric("Records after cleaning", f"{len(df):,}")
@@ -267,6 +268,47 @@ if page == "Overview & Data Quality":
     })
     st.dataframe(quality, use_container_width=True, hide_index=True)
     st.caption("Exact duplicates are removed only if enabled. Negative values in production-like measures are treated as missing, not as valid observations.")
+
+# ---------- Dedicated Data Cleaning ----------
+elif page == "Data Cleaning":
+    st.markdown("### Data cleaning")
+    st.write("Review missing values, inspect duplicates, choose an imputation method, and download a cleaned copy.")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", f"{len(df):,}")
+    c2.metric("Columns", f"{df.shape[1]:,}")
+    c3.metric("Exact duplicates found", f"{duplicates_found:,}")
+    c4.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
+    missing_report = pd.DataFrame({
+        "Column": df.columns,
+        "Data type": [str(df[c].dtype) for c in df.columns],
+        "Missing values": [int(df[c].isna().sum()) for c in df.columns],
+        "Missing (%)": [(df[c].isna().mean() * 100).round(2) for c in df.columns],
+        "Unique values": [int(df[c].nunique(dropna=True)) for c in df.columns],
+    }).sort_values("Missing (%)", ascending=False)
+    st.markdown("#### Missing-value report")
+    st.dataframe(missing_report, use_container_width=True, hide_index=True)
+    fill_method = st.selectbox("How should remaining missing values be handled?", [
+        "Leave missing values as-is", "Numeric: median; text: most frequent",
+        "Numeric: mean; text: most frequent", "Drop rows with any missing values"
+    ], key="clean_fill_method")
+    cleaned_output = df.copy()
+    if fill_method in ("Numeric: median; text: most frequent", "Numeric: mean; text: most frequent"):
+        for col in cleaned_output.columns:
+            if pd.api.types.is_numeric_dtype(cleaned_output[col]):
+                if cleaned_output[col].notna().any():
+                    value = cleaned_output[col].median() if fill_method.startswith("Numeric: median") else cleaned_output[col].mean()
+                    cleaned_output[col] = cleaned_output[col].fillna(value)
+            elif cleaned_output[col].notna().any():
+                mode = cleaned_output[col].mode(dropna=True)
+                if not mode.empty:
+                    cleaned_output[col] = cleaned_output[col].fillna(mode.iloc[0])
+    elif fill_method == "Drop rows with any missing values":
+        cleaned_output = cleaned_output.dropna().copy()
+    st.markdown("#### Cleaned data preview")
+    st.write(f"Rows in downloadable cleaned output: **{len(cleaned_output):,}**")
+    st.dataframe(cleaned_output.head(preview_rows), use_container_width=True)
+    st.download_button("Download cleaned dataset (CSV)", data=cleaned_output.to_csv(index=False).encode("utf-8-sig"),
+        file_name="cleaned_coconut_data.csv", mime="text/csv", use_container_width=True)
 
 # ---------- Statistics / EDA ----------
 elif page == "Statistics & Exploration":
@@ -427,55 +469,113 @@ elif page == "Classification & Prediction":
                 except Exception as exc:
                     st.error(f"Regression could not run with the selected columns: {exc}")
 
-                st.markdown("### Classification: low, medium, or high")
-                try:
-                    class_data = model_data.copy()
-                    class_y = pd.to_numeric(class_data[target], errors="coerce")
-                    class_data = class_data.loc[class_y.notna()].copy()
-                    class_y = class_y.loc[class_y.notna()]
-                    class_labels = pd.qcut(class_y, q=3, labels=["Low", "Medium", "High"], duplicates="drop")
-                    class_y = pd.Series(class_labels, index=class_y.index).astype("string")
-                    class_X = class_data.loc[class_y.index, feature_cols].drop(columns=[target], errors="ignore")
-                    if class_y.nunique() < 2 or class_y.value_counts().min() < 2:
-                        st.info("Classification skipped because the target does not contain enough examples in multiple harvest levels.")
+                st.markdown("### Classification and combination prediction")
+                st.write("Choose an outcome variable and a combination of input variables. The model will classify the outcome and can predict a class for a new combination you enter.")
+                categorical_targets = [c for c in model_data.columns if c != target and 2 <= model_data[c].nunique(dropna=True) <= 30 and (model_data[c].dtype == "object" or str(model_data[c].dtype) in ("string", "category", "bool"))]
+                numeric_targets = [c for c in get_numeric_columns(model_data) if c != target and model_data[c].nunique(dropna=True) >= 3]
+                target_options = categorical_targets + [c for c in numeric_targets if c not in categorical_targets]
+                if not target_options:
+                    st.info("No suitable classification outcome was found. Choose a categorical field such as injury severity, or a numeric field that can be grouped into low/medium/high.")
+                else:
+                    class_target = st.selectbox("Classification outcome", target_options, key="classification_target")
+                    raw_y = model_data[class_target]
+                    if pd.api.types.is_numeric_dtype(raw_y):
+                        numeric_mode = st.radio("Numeric outcome handling", ["Group into Low / Medium / High", "Use numeric values as classes"], horizontal=True, key="numeric_class_mode")
+                        if numeric_mode == "Group into Low / Medium / High":
+                            y_class = pd.qcut(pd.to_numeric(raw_y, errors="coerce"), q=3, labels=["Low", "Medium", "High"], duplicates="drop").astype("string")
+                        else:
+                            y_class = raw_y.astype("string")
                     else:
-                        stratify_y = class_y if class_y.value_counts().min() >= 2 else None
-                        Xtr, Xte, ytr, yte = train_test_split(
-                            class_X, class_y, test_size=test_fraction, random_state=42, stratify=stratify_y
-                        )
-                        clf = Pipeline([
-                            ("preprocess", make_preprocessor(Xtr)),
-                            ("model", RandomForestClassifier(
-                                n_estimators=200, random_state=42,
-                                class_weight="balanced_subsample", min_samples_leaf=2, n_jobs=-1
-                            )),
-                        ])
-                        clf.fit(Xtr, ytr)
-                        class_prediction = clf.predict(Xte)
-                        ca, cb = st.columns(2)
-                        ca.metric("Accuracy", f"{accuracy_score(yte, class_prediction):.1%}")
-                        cb.metric("Balanced accuracy", f"{balanced_accuracy_score(yte, class_prediction):.1%}")
-                        report = pd.DataFrame(classification_report(
-                            yte, class_prediction, output_dict=True, zero_division=0
-                        )).T
-                        st.dataframe(report.round(3), use_container_width=True)
-                        labels = sorted(class_y.dropna().unique())
-                        cm = confusion_matrix(yte, class_prediction, labels=labels)
-                        fig, ax = plt.subplots(figsize=(5, 4))
-                        ax.imshow(cm)
-                        ax.set_xticks(range(len(labels)), labels, rotation=30)
-                        ax.set_yticks(range(len(labels)), labels)
-                        ax.set_xlabel("Predicted")
-                        ax.set_ylabel("Actual")
-                        ax.set_title("Confusion matrix")
-                        for i in range(cm.shape[0]):
-                            for j in range(cm.shape[1]):
-                                ax.text(j, i, str(cm[i, j]), ha="center", va="center")
-                        fig.tight_layout()
-                        st.pyplot(fig)
-                        plt.close(fig)
-                except Exception as exc:
-                    st.info(f"Classification was skipped for this dataset: {exc}")
+                        y_class = raw_y.astype("string")
+                    feature_options = [c for c in model_data.columns if c != class_target and model_data[c].nunique(dropna=True) > 1]
+                    feature_options = [c for c in feature_options if not ((c.lower().strip() == "id" or c.lower().strip().endswith("_id")) and model_data[c].nunique(dropna=True) > .8 * len(model_data))]
+                    selected_features = st.multiselect("Input variables (choose a combination)", feature_options, default=feature_options[:min(5, len(feature_options))], help="Select the variables that should jointly predict the outcome.", key="classification_features")
+                    if not selected_features:
+                        st.warning("Select at least one input variable.")
+                    else:
+                        X_class = model_data[selected_features].copy()
+                        y_class = pd.Series(y_class, index=model_data.index)
+                        valid = y_class.notna()
+                        X_class, y_class = X_class.loc[valid], y_class.loc[valid].astype(str)
+                        counts = y_class.value_counts()
+                        keep = counts[counts >= 2].index
+                        mask = y_class.isin(keep)
+                        X_class, y_class = X_class.loc[mask], y_class.loc[mask]
+                        if len(y_class) < 6 or y_class.nunique() < 2:
+                            st.warning("There are not enough examples in multiple classes. Choose another outcome or upload more records.")
+                        else:
+                            test_size_cls = st.slider("Classification test proportion", .15, .40, .20, .05, key="classification_test_fraction")
+                            stratify = y_class if y_class.value_counts().min() >= 2 else None
+                            try:
+                                Xtr, Xte, ytr, yte = train_test_split(X_class, y_class, test_size=test_size_cls, random_state=42, stratify=stratify)
+                                clf = Pipeline([("preprocess", make_preprocessor(Xtr)), ("model", RandomForestClassifier(n_estimators=250, random_state=42, class_weight="balanced", min_samples_leaf=1, n_jobs=-1))])
+                                clf.fit(Xtr, ytr)
+                                yhat = clf.predict(Xte)
+                                st.metric("Accuracy", f"{accuracy_score(yte, yhat):.1%}")
+                                report = pd.DataFrame(classification_report(yte, yhat, output_dict=True, zero_division=0)).T
+                                report.index.name = "Class"
+                                st.markdown("#### Classification report")
+                                st.dataframe(report.round(4), use_container_width=True)
+                                with st.expander("What do the report columns mean?"):
+                                    st.write("**Precision:** how often predictions for a class are correct. **Recall:** how many actual examples of a class were found. **F1-score:** balance between precision and recall. **Support:** number of true test examples in that class.")
+                                    st.write("**Macro avg** treats classes equally; **weighted avg** accounts for each class's number of records. Very rare classes may score poorly because there are too few examples to learn from.")
+                                labels = list(clf.named_steps["model"].classes_)
+                                cm = confusion_matrix(yte, yhat, labels=labels)
+                                fig, ax = plt.subplots(figsize=(max(5, len(labels)*.9), 4.5))
+                                im = ax.imshow(cm, aspect="auto")
+                                ax.set_xticks(range(len(labels)), labels, rotation=35, ha="right")
+                                ax.set_yticks(range(len(labels)), labels)
+                                ax.set_xlabel("Predicted class"); ax.set_ylabel("Actual class"); ax.set_title("Confusion matrix")
+                                for i in range(cm.shape[0]):
+                                    for j in range(cm.shape[1]): ax.text(j, i, str(cm[i, j]), ha="center", va="center")
+                                fig.colorbar(im, ax=ax, label="Records"); fig.tight_layout(); st.pyplot(fig); plt.close(fig)
+                                try:
+                                    perm = permutation_importance(clf, Xte, yte, n_repeats=5, random_state=42, scoring="f1_weighted", n_jobs=-1)
+                                    importance = pd.DataFrame({"Variable": selected_features, "Importance": perm.importances_mean, "Description": [f"Contribution of {f} to weighted F1 when shuffled; this is model usefulness, not causation." for f in selected_features]}).sort_values("Importance", ascending=False)
+                                    st.markdown("#### Variable importance")
+                                    try:
+                                        import plotly.express as px
+                                        fig = px.bar(importance, x="Importance", y="Variable", orientation="h", hover_data={"Description": True, "Importance": ":.4f"}, title="Predictor importance — hover over a bar for its explanation")
+                                        st.plotly_chart(fig, use_container_width=True)
+                                    except ImportError:
+                                        st.bar_chart(importance.set_index("Variable")["Importance"], horizontal=True)
+                                        st.caption("Hover over bars for variable names and values. Importance measures model usefulness, not causation.")
+                                    with st.expander("How is variable importance calculated?"):
+                                        st.write("Permutation importance shuffles one variable at a time and measures how much the model score drops. Higher positive values suggest the model relies more on that variable; negative values can indicate noise.")
+                                except Exception as imp_exc:
+                                    st.info(f"Variable importance could not be calculated: {imp_exc}")
+                                st.markdown("#### Predict using a combination of values")
+                                st.caption("Enter one value for every selected input variable, then click the button to estimate the outcome.")
+                                user_values = {}
+                                for feature in selected_features:
+                                    series = X_class[feature]
+                                    if pd.api.types.is_numeric_dtype(series):
+                                        vals = pd.to_numeric(series, errors="coerce").dropna()
+                                        default = float(vals.median()) if not vals.empty else 0.0
+                                        low = float(vals.min()) if not vals.empty else 0.0
+                                        high = float(vals.max()) if not vals.empty else 1.0
+                                        if low == high: high = low + 1.0
+                                        user_values[feature] = st.number_input(feature, min_value=low, max_value=high, value=min(max(default, low), high), key=f"combo_{feature}")
+                                    else:
+                                        opts = series.dropna().astype(str).value_counts().index.tolist() or ["Unknown"]
+                                        user_values[feature] = st.selectbox(feature, opts, key=f"combo_cat_{feature}")
+                                if st.button("Predict outcome from combination", type="primary"):
+                                    one_row = pd.DataFrame([user_values], columns=selected_features)
+                                    outcome = clf.predict(one_row)[0]
+                                    st.success(f"Predicted {class_target}: {outcome}")
+                                    if hasattr(clf.named_steps["model"], "predict_proba"):
+                                        probs = clf.predict_proba(one_row)[0]
+                                        prob_df = pd.DataFrame({"Class": clf.named_steps["model"].classes_, "Probability": probs, "Description": [f"Estimated model probability for class {x}" for x in clf.named_steps["model"].classes_]}).sort_values("Probability", ascending=False)
+                                        try:
+                                            import plotly.express as px
+                                            fig = px.bar(prob_df, x="Probability", y="Class", orientation="h", hover_data={"Description": True, "Probability": ":.1%"}, title="Estimated class probabilities — hover for details")
+                                            st.plotly_chart(fig, use_container_width=True)
+                                        except ImportError:
+                                            st.bar_chart(prob_df.set_index("Class")["Probability"], horizontal=True)
+                                        st.dataframe(prob_df[["Class", "Probability"]].style.format({"Probability": "{:.1%}"}), use_container_width=True, hide_index=True)
+                                    st.session_state["classification_prediction_download"] = pd.DataFrame([{**user_values, "Predicted outcome": outcome}])
+                            except Exception as exc:
+                                st.error(f"Classification could not run with these settings: {exc}")
 
 # ---------- Forecasting ----------
 elif page == "Harvest Forecasting":
@@ -620,6 +720,16 @@ elif page == "Downloads":
             "Download latest test predictions (CSV)",
             data=prediction.to_csv(index=False).encode("utf-8-sig"),
             file_name="model_test_predictions.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    class_prediction_download = st.session_state.get("classification_prediction_download")
+    if class_prediction_download is not None:
+        st.download_button(
+            "Download latest combination prediction (CSV)",
+            data=class_prediction_download.to_csv(index=False).encode("utf-8-sig"),
+            file_name="combination_prediction.csv",
             mime="text/csv",
             use_container_width=True,
         )
