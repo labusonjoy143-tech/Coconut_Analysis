@@ -29,80 +29,117 @@ This notebook analyzes `Combine Data.xlsx` and covers:
 
 
 
-from pathlib import Path
-import pandas as pd
-import streamlit as st
 
+# -*- coding: utf-8 -*-
+
+from pathlib import Path
+from itertools import combinations
+import warnings
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.dummy import DummyClassifier, DummyRegressor
+from sklearn.inspection import permutation_importance
+
+try:
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
+
+warnings.filterwarnings("ignore")
+
+RANDOM_STATE = 42
+
+st.set_page_config(
+    page_title="Coconut Production Analysis",
+    page_icon="🥥",
+    layout="wide"
+)
+
+st.title("🥥 Coconut Production Analysis")
+st.caption(
+    "Statistical analysis, data cleaning, machine learning, "
+    "feature importance, and monthly harvest forecasting"
+)
+
+# Locate the CSV file beside app.py
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "Combine Data.csv"
 
 if not DATA_PATH.exists():
-    st.error("Combine Data.csv was not found.")
-    st.write("Files in the app folder:", [p.name for p in BASE_DIR.iterdir()])
+    st.error("Combine Data.csv was not found in the app folder.")
+    st.write("Files found:", [p.name for p in BASE_DIR.iterdir()])
     st.stop()
 
-# Try common CSV encodings
-encodings = ["utf-8-sig", "cp1252", "latin1"]
-
-raw = None
-
-for encoding in encodings:
+# Load the dataset only once
+try:
     try:
-        raw = pd.read_csv(DATA_PATH, encoding="cp1252")
-        st.success(f"Dataset loaded using {encoding} encoding.")
-        break
+        raw = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
     except UnicodeDecodeError:
-        continue
-
-if raw is None:
-    st.error("Unable to read the CSV file. Please check its encoding.")
-    st.stop()
-
-st.write("Dataset shape:", raw.shape)
-st.dataframe(raw.head())
-
-
-try:
-    if DATA_PATH.suffix.lower() == ".csv":
-        raw = pd.read_csv(DATA_PATH)
-    else:
-       raw = pd.read_csv(DATA_PATH, encoding="cp1252")
-
-    st.success(f"Loaded dataset: {DATA_PATH.name}")
-    st.write("Dataset dimensions:", raw.shape)
-    st.dataframe(raw.head())
+        raw = pd.read_csv(DATA_PATH, encoding="cp1252")
 
 except Exception as e:
     st.error(f"Dataset loading failed: {e}")
     st.stop()
 
+st.success(f"Dataset loaded: {DATA_PATH.name}")
+st.write("Original dataset dimensions:", raw.shape)
 
-try:
-    if DATA_PATH.suffix.lower() == ".csv":
-        try:
-            raw = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
-        except UnicodeDecodeError:
-            raw = pd.read_csv(DATA_PATH, encoding="cp1252")
-    else:
-        raw = pd.read_excel(DATA_PATH)
-
-    st.success(f"Dataset loaded: {DATA_PATH.name}")
-    st.write("Dataset shape:", raw.shape)
-    st.dataframe(raw.head())
-
-except Exception as e:
-    st.error(f"Dataset loading failed: {e}")
-    st.stop()
+with st.expander("Preview original dataset", expanded=True):
+    st.dataframe(raw.head(10), use_container_width=True)
 
 
-    st.success(f"Loaded dataset: {DATA_PATH.name}")
-    st.write("Dataset dimensions:", raw.shape)
-    st.dataframe(raw.head())
+# Dashboard navigation tabs
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "Data Quality",
+    "Statistics",
+    "Exploratory Analysis",
+    "Machine Learning",
+    "Feature Importance",
+    "Forecasting",
+    "Downloads"
+])
 
-except Exception as e:
-    st.error(f"Dataset loading failed: {e}")
-    st.stop()
 
+# Display notebook-style output in Streamlit
+def display(obj=None, *args, **kwargs):
+    if isinstance(obj, pd.DataFrame):
+        st.dataframe(obj, use_container_width=True)
+    elif isinstance(obj, pd.Series):
+        st.dataframe(obj.to_frame(), use_container_width=True)
+    elif obj is not None:
+        st.write(obj)
+
+
+# Display plots created by the existing notebook code
+def show_plot():
+    fig = plt.gcf()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+plt.show = show_plot
+sns.set_theme(style="whitegrid")
 
 """## 2. Inspect structure and data quality"""
 
