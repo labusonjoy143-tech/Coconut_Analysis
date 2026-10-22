@@ -28,27 +28,39 @@ This notebook analyzes `Combine Data.xlsx` and covers:
 
 
 
+
 from pathlib import Path
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_PATH = BASE_DIR / "Combine Data.csv"
 
-possible_paths = [
-    BASE_DIR / "Combine Data.xlsx",
-    BASE_DIR / "Combine Data.csv",
-]
-
-DATA_PATH = next((p for p in possible_paths if p.is_file()), None)
-
-if DATA_PATH is None:
-    st.error("Dataset not found in the application folder.")
-    st.write("Files found:", [p.name for p in BASE_DIR.iterdir()])
-    st.info(
-        "Upload Combine Data.xlsx or Combine Data.csv "
-        "to the same GitHub folder as app.py."
-    )
+if not DATA_PATH.exists():
+    st.error("Combine Data.csv was not found.")
+    st.write("Files in the app folder:", [p.name for p in BASE_DIR.iterdir()])
     st.stop()
+
+# Try common CSV encodings
+encodings = ["utf-8-sig", "cp1252", "latin1"]
+
+raw = None
+
+for encoding in encodings:
+    try:
+        raw = pd.read_csv(DATA_PATH, encoding=encoding)
+        st.success(f"Dataset loaded using {encoding} encoding.")
+        break
+    except UnicodeDecodeError:
+        continue
+
+if raw is None:
+    st.error("Unable to read the CSV file. Please check its encoding.")
+    st.stop()
+
+st.write("Dataset shape:", raw.shape)
+st.dataframe(raw.head())
+
 
 try:
     if DATA_PATH.suffix.lower() == ".csv":
