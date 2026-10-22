@@ -82,31 +82,54 @@ st.caption(
     "feature importance, and monthly harvest forecasting"
 )
 
-# Locate the CSV file beside app.py
-BASE_DIR = Path(__file__).resolve().parent
-DATA_PATH = BASE_DIR / "Combine Data.csv"
 
-if not DATA_PATH.exists():
-    st.error("Combine Data.csv was not found in the app folder.")
-    st.write("Files found:", [p.name for p in BASE_DIR.iterdir()])
-    st.stop()
+# Dataset upload section
+st.subheader("📂 Upload Coconut Production Dataset")
 
-# Load the dataset only once
-try:
+uploaded_file = st.file_uploader(
+    "Choose a dataset file",
+    type=["csv"],
+    help="Upload a CSV file containing your coconut production data."
+)
+
+# Load the uploaded dataset, or use the default CSV if no file is uploaded
+if uploaded_file is not None:
     try:
-        raw = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        raw = pd.read_csv(DATA_PATH, encoding="cp1252")
+        try:
+            raw = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            uploaded_file.seek(0)
+            raw = pd.read_csv(uploaded_file, encoding="cp1252")
 
-except Exception as e:
-    st.error(f"Dataset loading failed: {e}")
-    st.stop()
+        st.success(f"Uploaded dataset loaded: {uploaded_file.name}")
 
-st.success(f"Dataset loaded: {DATA_PATH.name}")
-st.write("Original dataset dimensions:", raw.shape)
+    except Exception as e:
+        st.error(f"Dataset loading failed: {e}")
+        st.stop()
 
-with st.expander("Preview original dataset", expanded=True):
+else:
+    DATA_PATH = Path(__file__).resolve().parent / "Combine Data.csv"
+
+    if DATA_PATH.exists():
+        try:
+            raw = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            raw = pd.read_csv(DATA_PATH, encoding="cp1252")
+        except Exception as e:
+            st.error(f"Dataset loading failed: {e}")
+            st.stop()
+
+        st.info("Using the default dataset: Combine Data.csv")
+
+    else:
+        st.info("Please upload a CSV dataset to begin.")
+        st.stop()
+
+st.write("Dataset dimensions:", raw.shape)
+
+with st.expander("👀 Preview dataset", expanded=True):
     st.dataframe(raw.head(10), use_container_width=True)
+
 
 
 # Dashboard navigation tabs
