@@ -79,7 +79,10 @@ except Exception as e:
 
 try:
     if DATA_PATH.suffix.lower() == ".csv":
-        raw = pd.read_csv(DATA_PATH)
+        try:
+            raw = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            raw = pd.read_csv(DATA_PATH, encoding="cp1252")
     else:
         raw = pd.read_excel(DATA_PATH)
 
@@ -91,12 +94,6 @@ except Exception as e:
     st.error(f"Dataset loading failed: {e}")
     st.stop()
 
-
-try:
-    if DATA_PATH.suffix.lower() == ".csv":
-        raw = pd.read_csv(DATA_PATH)
-    else:
-        raw = pd.read_excel(DATA_PATH)
 
     st.success(f"Loaded dataset: {DATA_PATH.name}")
     st.write("Dataset dimensions:", raw.shape)
