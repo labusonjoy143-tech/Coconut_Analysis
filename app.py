@@ -1,8 +1,8 @@
 # app.py
 # Coconut Production Analytics Dashboard
 # Run locally: streamlit run app.py
-# Deploy to Streamlit Community Cloud with app.py and requirements.txt only.
-# Users upload their own CSV in the browser; no dataset needs to be stored in GitHub.
+# Streamlit Community Cloud: keep app.py and requirements.txt in the repository root.
+# Users upload their own CSV; no dataset needs to be stored in GitHub.
 
 import warnings
 import numpy as np
@@ -38,7 +38,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------- Styling ----------
 st.markdown("""
 <style>
 .block-container {padding-top: 1.7rem; padding-bottom: 2rem;}
@@ -52,7 +51,6 @@ section[data-testid="stSidebar"] {border-right: 1px solid #e7e9ef;}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Helpers ----------
 MONTHS = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December"
@@ -65,28 +63,32 @@ NUMERIC_HINTS = [
     "quantity", "amount", "ton", "kg", "hectare", "humidity"
 ]
 
-def load_csv(uploaded_file):
-    encodings = ["utf-8-sig", "cp1252", "latin1"]
 
+def load_csv(uploaded_file):
+    """Read CSV files with common encodings, including Windows-encoded files."""
+    encodings = ["utf-8-sig", "cp1252", "latin1"]
+    last_error = None
     for encoding in encodings:
         try:
             uploaded_file.seek(0)
             return pd.read_csv(uploaded_file, encoding=encoding)
-        except UnicodeDecodeError:
-            continue
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    raise ValueError(f"Unable to decode this CSV file. Details: {last_error}")
 
-    raise ValueError("Unable to read this CSV file.")
 
 def clean_dataset(raw, trim_text=True, remove_duplicates=True):
     data = raw.copy()
     data.columns = [str(c).strip() for c in data.columns]
-    # Make duplicate column names unique to avoid ambiguous pandas operations.
-    seen = {}
-    new_columns = []
+
+    # Ensure column names are unique.
+    seen, new_columns = {}, []
     for col in data.columns:
         seen[col] = seen.get(col, 0) + 1
         new_columns.append(col if seen[col] == 1 else f"{col}_{seen[col]}")
     data.columns = new_columns
+
+    data = data.dropna(how="all").dropna(axis=1, how="all")
 
     if trim_text:
         for col in data.select_dtypes(include=["object", "string"]).columns:
@@ -96,40 +98,52 @@ def clean_dataset(raw, trim_text=True, remove_duplicates=True):
                 "null": pd.NA, "None": pd.NA, "nan": pd.NA
             })
 
-    # Convert likely numeric columns when their names suggest numeric values.
     for col in data.columns:
         name = str(col).lower()
         if any(hint in name for hint in NUMERIC_HINTS):
-            original_nonmissing = data[col].notna().sum()
+            original_nonmissing = int(data[col].notna().sum())
             converted = pd.to_numeric(
-                data[col].astype("string").str.replace(",", "", regex=False)
-                .str.replace("%", "", regex=False),
+                data[col].astype("string")
+                .str.replace(",", "", regex=False)
+                .str.replace("%", "", regex=False)
+                .str.replace("₱", "", regex=False)
+                .str.strip(),
                 errors="coerce"
             )
-            # Avoid turning categorical labels into all-missing columns.
-            if original_nonmissing == 0 or converted.notna().sum() >= max(1, int(original_nonmissing * 0.5)):
+            if original_nonmissing > 0 and converted.notna().sum() >= max(
+                1, int(original_nonmissing * 0.5)
+            ):
                 data[col] = converted
 
     duplicate_count = int(data.duplicated().sum())
     if remove_duplicates:
         data = data.drop_duplicates().copy()
 
-    # Negative values are invalid for these numeric measures; mark as missing.
+    # Treat negative values in nonnegative measures as invalid/missing.
+    nonnegative_tokens = [
+        "harvest", "production", "yield", "area", "rainfall",
+        "price", "supply", "volume", "quantity"
+    ]
     for col in data.columns:
         name = str(col).lower()
-        if pd.api.types.is_numeric_dtype(data[col]) and any(
-            token in name for token in ["harvest", "production", "yield", "area", "rainfall", "price", "supply", "volume", "quantity"]
-        ):
+        if (pd.api.types.is_numeric_dtype(data[col])
+                and any(token in name for token in nonnegative_tokens)):
             data.loc[data[col] < 0, col] = np.nan
+
     return data, duplicate_count
+
 
 def get_numeric_columns(data):
     return data.select_dtypes(include=np.number).columns.tolist()
 
+
 def make_preprocessor(X):
     numeric = X.select_dtypes(include=np.number).columns.tolist()
-    categorical = X.select_dtypes(include=["object", "string", "category", "bool"]).columns.tolist()
+    categorical = X.select_dtypes(
+        include=["object", "string", "category", "bool"]
+    ).columns.tolist()
     transformers = []
+
     if numeric:
         transformers.append((
             "numeric",
@@ -152,8 +166,12 @@ def make_preprocessor(X):
         raise ValueError("No usable predictor columns were found.")
     return ColumnTransformer(transformers, remainder="drop")
 
+
 def plot_histogram(series, title, xlabel):
     values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        st.info("There are no valid numeric values to plot.")
+        return
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.hist(values, bins=25, edgecolor="white")
     ax.set_title(title)
@@ -162,6 +180,7 @@ def plot_histogram(series, title, xlabel):
     fig.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
+
 
 def plot_correlation(data, columns):
     corr = data[columns].corr(numeric_only=True)
@@ -178,13 +197,24 @@ def plot_correlation(data, columns):
     st.pyplot(fig)
     plt.close(fig)
 
+
+def quality_report(data):
+    return pd.DataFrame({
+        "Column": data.columns,
+        "Data type": [str(data[c].dtype) for c in data.columns],
+        "Missing values": [int(data[c].isna().sum()) for c in data.columns],
+        "Missing (%)": [(data[c].isna().mean() * 100).round(2) for c in data.columns],
+        "Unique values": [int(data[c].nunique(dropna=True)) for c in data.columns],
+    })
+
+
 # ---------- Sidebar ----------
 st.sidebar.markdown("## 🥥 Coconut Analytics")
 st.sidebar.caption("Production • Statistics • Prediction")
 uploaded_file = st.sidebar.file_uploader(
     "Upload your dataset",
-    type=["csv"],
-    help="Upload a CSV file from your device. The dataset does not need to be in GitHub."
+    type=["csv", "xlsx"],
+    help="Upload a CSV or Excel file from your device. The dataset does not need to be in GitHub."
 )
 
 with st.sidebar.expander("Cleaning settings", expanded=False):
@@ -204,34 +234,44 @@ page = st.sidebar.radio(
     ],
 )
 
-# ---------- Header ----------
-st.markdown('<div class="dashboard-title">Coconut Production Analytics</div>', unsafe_allow_html=True)
-st.caption("Analyze coconut production records, explore trends, evaluate prediction models, and forecast future harvest.")
+st.markdown(
+    '<div class="dashboard-title">Coconut Production Analytics</div>',
+    unsafe_allow_html=True
+)
+st.caption(
+    "Analyze coconut production records, explore trends, evaluate prediction models, "
+    "and forecast future harvest."
+)
 
 if uploaded_file is None:
-    st.info("Upload a CSV dataset using the left sidebar to begin. No dataset is loaded from GitHub.")
-    st.markdown("### Getting started")
+    st.info("Upload a CSV or Excel dataset using the left sidebar to begin. No dataset is loaded from GitHub.")
     col1, col2, col3 = st.columns(3)
     with col1:
         st.markdown("#### 1. Upload")
-        st.write("Choose a CSV file from your computer.")
+        st.write("Choose a dataset from your computer.")
     with col2:
         st.markdown("#### 2. Explore")
         st.write("Review missing values, statistics, and production trends.")
     with col3:
         st.markdown("#### 3. Analyze")
-        st.write("Run classification, regression, forecasting, and export results.")
-    st.markdown("**Recommended fields (your column names may differ):** Year, Month, Barangay, Harvest (kg), Harvested Area (ha), Rainfall, Temperature, and prices.")
+        st.write("Run prediction models, forecasting, and export results.")
+    st.markdown(
+        "**Recommended fields (your column names may differ):** Year, Month, "
+        "Barangay, Harvest (kg), Harvested Area (ha), Rainfall, Temperature, and prices."
+    )
     st.stop()
 
 try:
-    raw_data = read_uploaded_csv(uploaded_file)
-except ValueError as exc:
-    st.error(str(exc))
+    if uploaded_file.name.lower().endswith(".csv"):
+        raw_data = load_csv(uploaded_file)
+    else:
+        raw_data = pd.read_excel(uploaded_file)
+except Exception as exc:
+    st.error(f"Could not read the uploaded dataset: {exc}")
     st.stop()
 
 if raw_data.empty:
-    st.error("The CSV contains column headers but no data rows.")
+    st.error("The uploaded file contains column headers but no data rows.")
     st.stop()
 
 df, duplicates_found = clean_dataset(raw_data, trim_text, remove_duplicates)
@@ -239,9 +279,11 @@ if df.empty:
     st.error("No records remain after cleaning. Review the uploaded file and cleaning settings.")
     st.stop()
 
-# Persist generated forecast within the current Streamlit session only.
-if "forecast_download" not in st.session_state:
-    st.session_state["forecast_download"] = None
+for key in [
+    "forecast_download", "prediction_download", "classification_prediction_download"
+]:
+    if key not in st.session_state:
+        st.session_state[key] = None
 
 # ---------- Overview ----------
 if page == "Overview":
@@ -253,20 +295,16 @@ if page == "Overview":
     d.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
 
     st.markdown("### Uploaded data preview")
-    st.dataframe(df.head(preview_rows), use_container_width=True)
+    st.dataframe(df.head(preview_rows), width="stretch")
 
     st.markdown("### Data quality report")
-    quality = pd.DataFrame({
-        "Column": df.columns,
-        "Data type": [str(df[c].dtype) for c in df.columns],
-        "Missing values": [int(df[c].isna().sum()) for c in df.columns],
-        "Missing (%)": [(df[c].isna().mean() * 100).round(2) for c in df.columns],
-        "Unique values": [int(df[c].nunique(dropna=True)) for c in df.columns],
-    })
-    st.dataframe(quality, use_container_width=True, hide_index=True)
-    st.caption("Exact duplicates are removed only if enabled. Negative values in production-like measures are treated as missing, not as valid observations.")
+    st.dataframe(quality_report(df), width="stretch", hide_index=True)
+    st.caption(
+        "Exact duplicates are removed only if enabled. Negative values in production-like "
+        "measures are treated as missing, not as valid observations."
+    )
 
-# ---------- Dedicated Data Cleaning ----------
+# ---------- Data Cleaning ----------
 elif page == "Data Cleaning":
     st.markdown("### Data cleaning")
     st.write("Review missing values, inspect duplicates, choose an imputation method, and download a cleaned copy.")
@@ -275,25 +313,35 @@ elif page == "Data Cleaning":
     c2.metric("Columns", f"{df.shape[1]:,}")
     c3.metric("Exact duplicates found", f"{duplicates_found:,}")
     c4.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
-    missing_report = pd.DataFrame({
-        "Column": df.columns,
-        "Data type": [str(df[c].dtype) for c in df.columns],
-        "Missing values": [int(df[c].isna().sum()) for c in df.columns],
-        "Missing (%)": [(df[c].isna().mean() * 100).round(2) for c in df.columns],
-        "Unique values": [int(df[c].nunique(dropna=True)) for c in df.columns],
-    }).sort_values("Missing (%)", ascending=False)
+
     st.markdown("#### Missing-value report")
-    st.dataframe(missing_report, use_container_width=True, hide_index=True)
-    fill_method = st.selectbox("How should remaining missing values be handled?", [
-        "Leave missing values as-is", "Numeric: median; text: most frequent",
-        "Numeric: mean; text: most frequent", "Drop rows with any missing values"
-    ], key="clean_fill_method")
+    st.dataframe(
+        quality_report(df).sort_values("Missing (%)", ascending=False),
+        width="stretch", hide_index=True
+    )
+    fill_method = st.selectbox(
+        "How should remaining missing values be handled?",
+        [
+            "Leave missing values as-is",
+            "Numeric: median; text: most frequent",
+            "Numeric: mean; text: most frequent",
+            "Drop rows with any missing values"
+        ],
+        key="clean_fill_method"
+    )
     cleaned_output = df.copy()
-    if fill_method in ("Numeric: median; text: most frequent", "Numeric: mean; text: most frequent"):
+    if fill_method in (
+        "Numeric: median; text: most frequent",
+        "Numeric: mean; text: most frequent"
+    ):
         for col in cleaned_output.columns:
             if pd.api.types.is_numeric_dtype(cleaned_output[col]):
                 if cleaned_output[col].notna().any():
-                    value = cleaned_output[col].median() if fill_method.startswith("Numeric: median") else cleaned_output[col].mean()
+                    value = (
+                        cleaned_output[col].median()
+                        if fill_method.startswith("Numeric: median")
+                        else cleaned_output[col].mean()
+                    )
                     cleaned_output[col] = cleaned_output[col].fillna(value)
             elif cleaned_output[col].notna().any():
                 mode = cleaned_output[col].mode(dropna=True)
@@ -301,18 +349,24 @@ elif page == "Data Cleaning":
                     cleaned_output[col] = cleaned_output[col].fillna(mode.iloc[0])
     elif fill_method == "Drop rows with any missing values":
         cleaned_output = cleaned_output.dropna().copy()
+
     st.markdown("#### Cleaned data preview")
     st.write(f"Rows in downloadable cleaned output: **{len(cleaned_output):,}**")
-    st.dataframe(cleaned_output.head(preview_rows), use_container_width=True)
-    st.download_button("Download cleaned dataset (CSV)", data=cleaned_output.to_csv(index=False).encode("utf-8-sig"),
-        file_name="cleaned_coconut_data.csv", mime="text/csv", use_container_width=True)
+    st.dataframe(cleaned_output.head(preview_rows), width="stretch")
+    st.download_button(
+        "Download cleaned dataset (CSV)",
+        data=cleaned_output.to_csv(index=False).encode("utf-8-sig"),
+        file_name="cleaned_coconut_data.csv",
+        mime="text/csv",
+        width="stretch"
+    )
 
 # ---------- Statistics / EDA ----------
 elif page == "Statistics & Exploration":
     numeric_cols = get_numeric_columns(df)
     if numeric_cols:
         st.markdown("### Descriptive statistics")
-        st.dataframe(df[numeric_cols].describe().T.round(3), use_container_width=True)
+        st.dataframe(df[numeric_cols].describe().T.round(3), width="stretch")
 
         st.markdown("### Correlation analysis")
         if len(numeric_cols) >= 2:
@@ -323,18 +377,23 @@ elif page == "Statistics & Exploration":
         selected_num = st.selectbox("Select a numeric field to explore", numeric_cols)
         plot_histogram(df[selected_num], f"Distribution of {selected_num}", selected_num)
     else:
-        st.warning("No numeric columns were detected. Check whether numeric fields in your CSV contain text or symbols.")
+        st.warning("No numeric columns were detected. Check whether numeric fields contain text or symbols.")
 
     possible_categories = [
         col for col in df.columns
-        if (df[col].dtype == "object" or str(df[col].dtype) in ("string", "category", "bool"))
+        if (
+            pd.api.types.is_object_dtype(df[col])
+            or pd.api.types.is_string_dtype(df[col])
+            or pd.api.types.is_categorical_dtype(df[col])
+            or pd.api.types.is_bool_dtype(df[col])
+        )
         and 1 < df[col].nunique(dropna=True) <= 100
     ]
     if possible_categories:
         st.markdown("### Category breakdown")
         category = st.selectbox("Choose a category field", possible_categories)
         counts = df[category].fillna("Missing").astype(str).value_counts().head(20)
-        st.dataframe(counts.rename("Records").to_frame(), use_container_width=True)
+        st.dataframe(counts.rename("Records").to_frame(), width="stretch")
         fig, ax = plt.subplots(figsize=(9, 4))
         counts.sort_values().plot(kind="barh", ax=ax)
         ax.set_title(f"Records by {category}")
@@ -342,12 +401,18 @@ elif page == "Statistics & Exploration":
         st.pyplot(fig)
         plt.close(fig)
 
-    barangay_col = next((c for c in df.columns if c.lower().strip() in ("barangay", "village", "location")), None)
-    harvest_col = next((c for c in df.columns if "harvest" in c.lower() and pd.api.types.is_numeric_dtype(df[c])), None)
+    barangay_col = next(
+        (c for c in df.columns if c.lower().strip() in ("barangay", "village", "location")),
+        None
+    )
+    harvest_col = next(
+        (c for c in df.columns if "harvest" in c.lower() and pd.api.types.is_numeric_dtype(df[c])),
+        None
+    )
     if barangay_col and harvest_col:
         st.markdown("### Harvest by location")
         grouped = df.groupby(barangay_col, dropna=False)[harvest_col].sum(min_count=1).sort_values(ascending=False)
-        st.dataframe(grouped.rename(f"Total {harvest_col}").to_frame(), use_container_width=True)
+        st.dataframe(grouped.rename(f"Total {harvest_col}").to_frame(), width="stretch")
         fig, ax = plt.subplots(figsize=(10, 4))
         grouped.sort_values().plot(kind="barh", ax=ax)
         ax.set_xlabel(harvest_col)
@@ -366,16 +431,22 @@ elif page == "Classification & Prediction":
         st.warning("No likely numeric production target was detected. Ensure your CSV has a numeric harvest, production, yield, supply, or quantity column.")
     else:
         target = st.selectbox("Choose the value to predict", suggested_targets)
-        st.caption("Models use the uploaded dataset only. Results are estimates and do not prove that a variable causes a change in production.")
+        st.caption(
+            "Models use the uploaded dataset only. Results are estimates and do not prove "
+            "that a variable causes a change in production. Avoid predictors that directly "
+            "contain or were calculated from the target."
+        )
         model_data = df[df[target].notna()].copy()
-        # Exclude identifiers that are likely unique record IDs.
         feature_cols = []
         for col in model_data.columns:
             if col == target:
                 continue
             if model_data[col].isna().all() or model_data[col].nunique(dropna=True) <= 1:
                 continue
-            if ("id" == col.lower().strip() or col.lower().strip().endswith("_id")) and model_data[col].nunique() > 0.8 * len(model_data):
+            if (
+                (col.lower().strip() == "id" or col.lower().strip().endswith("_id"))
+                and model_data[col].nunique() > 0.8 * len(model_data)
+            ):
                 continue
             feature_cols.append(col)
 
@@ -438,7 +509,7 @@ elif page == "Classification & Prediction":
                             "R²": r2_score(y_test, baseline_prediction) if len(y_test) > 1 else np.nan,
                         }
                     ])
-                    st.dataframe(comparison.round(4), use_container_width=True, hide_index=True)
+                    st.dataframe(comparison.round(4), width="stretch", hide_index=True)
 
                     st.markdown("### Predictor importance")
                     with st.spinner("Calculating permutation importance..."):
@@ -450,7 +521,7 @@ elif page == "Classification & Prediction":
                         "Predictor": X_test.columns,
                         "Importance": importance_result.importances_mean
                     }).sort_values("Importance", ascending=False)
-                    st.dataframe(importance, use_container_width=True, hide_index=True)
+                    st.dataframe(importance, width="stretch", hide_index=True)
                     fig, ax = plt.subplots(figsize=(9, 4))
                     importance.sort_values("Importance").plot(
                         kind="barh", x="Predictor", y="Importance", legend=False, ax=ax
@@ -467,26 +538,77 @@ elif page == "Classification & Prediction":
                     st.error(f"Regression could not run with the selected columns: {exc}")
 
                 st.markdown("### Classification and combination prediction")
-                st.write("Choose an outcome variable and a combination of input variables. The model will classify the outcome and can predict a class for a new combination you enter.")
-                categorical_targets = [c for c in model_data.columns if c != target and 2 <= model_data[c].nunique(dropna=True) <= 30 and (model_data[c].dtype == "object" or str(model_data[c].dtype) in ("string", "category", "bool"))]
-                numeric_targets = [c for c in get_numeric_columns(model_data) if c != target and model_data[c].nunique(dropna=True) >= 3]
-                target_options = categorical_targets + [c for c in numeric_targets if c not in categorical_targets]
+                st.write(
+                    "Choose an outcome variable and input variables. The model classifies "
+                    "the outcome and can estimate a class for a new combination."
+                )
+                categorical_targets = [
+                    c for c in model_data.columns
+                    if c != target
+                    and 2 <= model_data[c].nunique(dropna=True) <= 30
+                    and (
+                        pd.api.types.is_object_dtype(model_data[c])
+                        or pd.api.types.is_string_dtype(model_data[c])
+                        or pd.api.types.is_categorical_dtype(model_data[c])
+                        or pd.api.types.is_bool_dtype(model_data[c])
+                    )
+                ]
+                numeric_targets = [
+                    c for c in get_numeric_columns(model_data)
+                    if c != target and model_data[c].nunique(dropna=True) >= 3
+                ]
+                target_options = categorical_targets + [
+                    c for c in numeric_targets if c not in categorical_targets
+                ]
                 if not target_options:
-                    st.info("No suitable classification outcome was found. Choose a categorical field such as injury severity, or a numeric field that can be grouped into low/medium/high.")
+                    st.info("No suitable classification outcome was found. Choose a categorical field or a numeric field that can be grouped into Low / Medium / High.")
                 else:
-                    class_target = st.selectbox("Classification outcome", target_options, key="classification_target")
+                    class_target = st.selectbox(
+                        "Classification outcome", target_options, key="classification_target"
+                    )
                     raw_y = model_data[class_target]
                     if pd.api.types.is_numeric_dtype(raw_y):
-                        numeric_mode = st.radio("Numeric outcome handling", ["Group into Low / Medium / High", "Use numeric values as classes"], horizontal=True, key="numeric_class_mode")
+                        numeric_mode = st.radio(
+                            "Numeric outcome handling",
+                            ["Group into Low / Medium / High", "Use numeric values as classes"],
+                            horizontal=True, key="numeric_class_mode"
+                        )
                         if numeric_mode == "Group into Low / Medium / High":
-                            y_class = pd.qcut(pd.to_numeric(raw_y, errors="coerce"), q=3, labels=["Low", "Medium", "High"], duplicates="drop").astype("string")
+                            numeric_y = pd.to_numeric(raw_y, errors="coerce")
+                            try:
+                                y_class = pd.qcut(
+                                    numeric_y, q=3,
+                                    labels=["Low", "Medium", "High"],
+                                    duplicates="drop"
+                                ).astype("string")
+                            except ValueError:
+                                y_class = pd.Series(pd.NA, index=raw_y.index, dtype="string")
                         else:
                             y_class = raw_y.astype("string")
                     else:
                         y_class = raw_y.astype("string")
-                    feature_options = [c for c in model_data.columns if c != class_target and model_data[c].nunique(dropna=True) > 1]
-                    feature_options = [c for c in feature_options if not ((c.lower().strip() == "id" or c.lower().strip().endswith("_id")) and model_data[c].nunique(dropna=True) > .8 * len(model_data))]
-                    selected_features = st.multiselect("Input variables (choose a combination)", feature_options, default=feature_options[:min(5, len(feature_options))], help="Select the variables that should jointly predict the outcome.", key="classification_features")
+
+                    # Prevent target leakage: neither the selected classification outcome
+                    # nor the primary production target can be used as a predictor.
+                    feature_options = [
+                        c for c in model_data.columns
+                        if c not in (class_target, target)
+                        and model_data[c].nunique(dropna=True) > 1
+                    ]
+                    feature_options = [
+                        c for c in feature_options
+                        if not (
+                            (c.lower().strip() == "id" or c.lower().strip().endswith("_id"))
+                            and model_data[c].nunique(dropna=True) > 0.8 * len(model_data)
+                        )
+                    ]
+                    selected_features = st.multiselect(
+                        "Input variables (choose a combination)",
+                        feature_options,
+                        default=feature_options[:min(5, len(feature_options))],
+                        help="Choose variables available before the outcome occurs. Avoid fields derived from the outcome.",
+                        key="classification_features"
+                    )
                     if not selected_features:
                         st.warning("Select at least one input variable.")
                     else:
@@ -498,49 +620,93 @@ elif page == "Classification & Prediction":
                         keep = counts[counts >= 2].index
                         mask = y_class.isin(keep)
                         X_class, y_class = X_class.loc[mask], y_class.loc[mask]
+
                         if len(y_class) < 6 or y_class.nunique() < 2:
                             st.warning("There are not enough examples in multiple classes. Choose another outcome or upload more records.")
                         else:
-                            test_size_cls = st.slider("Classification test proportion", .15, .40, .20, .05, key="classification_test_fraction")
+                            test_size_cls = st.slider(
+                                "Classification test proportion", .15, .40, .20, .05,
+                                key="classification_test_fraction"
+                            )
                             stratify = y_class if y_class.value_counts().min() >= 2 else None
                             try:
-                                Xtr, Xte, ytr, yte = train_test_split(X_class, y_class, test_size=test_size_cls, random_state=42, stratify=stratify)
-                                clf = Pipeline([("preprocess", make_preprocessor(Xtr)), ("model", RandomForestClassifier(n_estimators=250, random_state=42, class_weight="balanced", min_samples_leaf=1, n_jobs=-1))])
+                                Xtr, Xte, ytr, yte = train_test_split(
+                                    X_class, y_class, test_size=test_size_cls,
+                                    random_state=42, stratify=stratify
+                                )
+                                clf = Pipeline([
+                                    ("preprocess", make_preprocessor(Xtr)),
+                                    ("model", RandomForestClassifier(
+                                        n_estimators=250, random_state=42,
+                                        class_weight="balanced", min_samples_leaf=1, n_jobs=-1
+                                    ))
+                                ])
                                 clf.fit(Xtr, ytr)
                                 yhat = clf.predict(Xte)
-                                st.metric("Accuracy", f"{accuracy_score(yte, yhat):.1%}")
-                                report = pd.DataFrame(classification_report(yte, yhat, output_dict=True, zero_division=0)).T
+                                score1, score2 = st.columns(2)
+                                score1.metric("Accuracy", f"{accuracy_score(yte, yhat):.1%}")
+                                score2.metric("Balanced accuracy", f"{balanced_accuracy_score(yte, yhat):.1%}")
+                                report = pd.DataFrame(
+                                    classification_report(
+                                        yte, yhat, output_dict=True, zero_division=0
+                                    )
+                                ).T
                                 report.index.name = "Class"
                                 st.markdown("#### Classification report")
-                                st.dataframe(report.round(4), use_container_width=True)
+                                st.dataframe(report.round(4), width="stretch")
                                 with st.expander("What do the report columns mean?"):
                                     st.write("**Precision:** how often predictions for a class are correct. **Recall:** how many actual examples of a class were found. **F1-score:** balance between precision and recall. **Support:** number of true test examples in that class.")
-                                    st.write("**Macro avg** treats classes equally; **weighted avg** accounts for each class's number of records. Very rare classes may score poorly because there are too few examples to learn from.")
+                                    st.write("**Macro avg** treats classes equally; **weighted avg** accounts for each class's number of records. Rare classes may score poorly if there are too few examples.")
                                 labels = list(clf.named_steps["model"].classes_)
                                 cm = confusion_matrix(yte, yhat, labels=labels)
-                                fig, ax = plt.subplots(figsize=(max(5, len(labels)*.9), 4.5))
+                                fig, ax = plt.subplots(figsize=(max(5, len(labels) * .9), 4.5))
                                 im = ax.imshow(cm, aspect="auto")
                                 ax.set_xticks(range(len(labels)), labels, rotation=35, ha="right")
                                 ax.set_yticks(range(len(labels)), labels)
-                                ax.set_xlabel("Predicted class"); ax.set_ylabel("Actual class"); ax.set_title("Confusion matrix")
+                                ax.set_xlabel("Predicted class")
+                                ax.set_ylabel("Actual class")
+                                ax.set_title("Confusion matrix")
                                 for i in range(cm.shape[0]):
-                                    for j in range(cm.shape[1]): ax.text(j, i, str(cm[i, j]), ha="center", va="center")
-                                fig.colorbar(im, ax=ax, label="Records"); fig.tight_layout(); st.pyplot(fig); plt.close(fig)
+                                    for j in range(cm.shape[1]):
+                                        ax.text(j, i, str(cm[i, j]), ha="center", va="center")
+                                fig.colorbar(im, ax=ax, label="Records")
+                                fig.tight_layout()
+                                st.pyplot(fig)
+                                plt.close(fig)
+
                                 try:
-                                    perm = permutation_importance(clf, Xte, yte, n_repeats=5, random_state=42, scoring="f1_weighted", n_jobs=-1)
-                                    importance = pd.DataFrame({"Variable": selected_features, "Importance": perm.importances_mean, "Description": [f"Contribution of {f} to weighted F1 when shuffled; this is model usefulness, not causation." for f in selected_features]}).sort_values("Importance", ascending=False)
+                                    perm = permutation_importance(
+                                        clf, Xte, yte, n_repeats=5,
+                                        random_state=42, scoring="f1_weighted", n_jobs=-1
+                                    )
+                                    importance = pd.DataFrame({
+                                        "Variable": selected_features,
+                                        "Importance": perm.importances_mean,
+                                        "Description": [
+                                            f"Contribution of {f} to weighted F1 when shuffled; this is model usefulness, not causation."
+                                            for f in selected_features
+                                        ]
+                                    }).sort_values("Importance", ascending=False)
                                     st.markdown("#### Variable importance")
                                     try:
                                         import plotly.express as px
-                                        fig = px.bar(importance, x="Importance", y="Variable", orientation="h", hover_data={"Description": True, "Importance": ":.4f"}, title="Predictor importance — hover over a bar for its explanation")
-                                        st.plotly_chart(fig, use_container_width=True)
+                                        fig = px.bar(
+                                            importance, x="Importance", y="Variable",
+                                            orientation="h", hover_data={"Description": True, "Importance": ":.4f"},
+                                            title="Predictor importance — hover over a bar for its explanation"
+                                        )
+                                        st.plotly_chart(fig, width="stretch")
                                     except ImportError:
-                                        st.bar_chart(importance.set_index("Variable")["Importance"], horizontal=True)
-                                        st.caption("Hover over bars for variable names and values. Importance measures model usefulness, not causation.")
+                                        st.bar_chart(
+                                            importance.set_index("Variable")["Importance"],
+                                            horizontal=True
+                                        )
+                                        st.caption("Importance measures model usefulness, not causation.")
                                     with st.expander("How is variable importance calculated?"):
                                         st.write("Permutation importance shuffles one variable at a time and measures how much the model score drops. Higher positive values suggest the model relies more on that variable; negative values can indicate noise.")
                                 except Exception as imp_exc:
                                     st.info(f"Variable importance could not be calculated: {imp_exc}")
+
                                 st.markdown("#### Predict using a combination of values")
                                 st.caption("Enter one value for every selected input variable, then click the button to estimate the outcome.")
                                 user_values = {}
@@ -551,38 +717,75 @@ elif page == "Classification & Prediction":
                                         default = float(vals.median()) if not vals.empty else 0.0
                                         low = float(vals.min()) if not vals.empty else 0.0
                                         high = float(vals.max()) if not vals.empty else 1.0
-                                        if low == high: high = low + 1.0
-                                        user_values[feature] = st.number_input(feature, min_value=low, max_value=high, value=min(max(default, low), high), key=f"combo_{feature}")
+                                        if low == high:
+                                            high = low + 1.0
+                                        user_values[feature] = st.number_input(
+                                            feature, min_value=low, max_value=high,
+                                            value=min(max(default, low), high),
+                                            key=f"combo_{feature}"
+                                        )
                                     else:
                                         opts = series.dropna().astype(str).value_counts().index.tolist() or ["Unknown"]
-                                        user_values[feature] = st.selectbox(feature, opts, key=f"combo_cat_{feature}")
+                                        user_values[feature] = st.selectbox(
+                                            feature, opts, key=f"combo_cat_{feature}"
+                                        )
+
                                 if st.button("Predict outcome from combination", type="primary"):
                                     one_row = pd.DataFrame([user_values], columns=selected_features)
                                     outcome = clf.predict(one_row)[0]
                                     st.success(f"Predicted {class_target}: {outcome}")
                                     if hasattr(clf.named_steps["model"], "predict_proba"):
                                         probs = clf.predict_proba(one_row)[0]
-                                        prob_df = pd.DataFrame({"Class": clf.named_steps["model"].classes_, "Probability": probs, "Description": [f"Estimated model probability for class {x}" for x in clf.named_steps["model"].classes_]}).sort_values("Probability", ascending=False)
+                                        prob_df = pd.DataFrame({
+                                            "Class": clf.named_steps["model"].classes_,
+                                            "Probability": probs,
+                                            "Description": [
+                                                f"Estimated model probability for class {x}"
+                                                for x in clf.named_steps["model"].classes_
+                                            ]
+                                        }).sort_values("Probability", ascending=False)
                                         try:
                                             import plotly.express as px
-                                            fig = px.bar(prob_df, x="Probability", y="Class", orientation="h", hover_data={"Description": True, "Probability": ":.1%"}, title="Estimated class probabilities — hover for details")
-                                            st.plotly_chart(fig, use_container_width=True)
+                                            fig = px.bar(
+                                                prob_df, x="Probability", y="Class",
+                                                orientation="h",
+                                                hover_data={"Description": True, "Probability": ":.1%"},
+                                                title="Estimated class probabilities — hover for details"
+                                            )
+                                            st.plotly_chart(fig, width="stretch")
                                         except ImportError:
-                                            st.bar_chart(prob_df.set_index("Class")["Probability"], horizontal=True)
-                                        st.dataframe(prob_df[["Class", "Probability"]].style.format({"Probability": "{:.1%}"}), use_container_width=True, hide_index=True)
-                                    st.session_state["classification_prediction_download"] = pd.DataFrame([{**user_values, "Predicted outcome": outcome}])
+                                            st.bar_chart(
+                                                prob_df.set_index("Class")["Probability"],
+                                                horizontal=True
+                                            )
+                                        st.dataframe(
+                                            prob_df[["Class", "Probability"]].style.format(
+                                                {"Probability": "{:.1%}"}
+                                            ),
+                                            width="stretch", hide_index=True
+                                        )
+                                    st.session_state["classification_prediction_download"] = pd.DataFrame(
+                                        [{**user_values, "Predicted outcome": outcome}]
+                                    )
                             except Exception as exc:
                                 st.error(f"Classification could not run with these settings: {exc}")
 
 # ---------- Forecasting ----------
 elif page == "Harvest Forecasting":
     st.markdown("### Monthly harvest forecast")
-    year_col = next((c for c in df.columns if c.lower().strip() in ("year", "harvest year", "production year")), None)
-    month_col = next((c for c in df.columns if c.lower().strip() in ("month", "harvest month", "production month")), None)
+    year_col = next(
+        (c for c in df.columns if c.lower().strip() in ("year", "harvest year", "production year")),
+        None
+    )
+    month_col = next(
+        (c for c in df.columns if c.lower().strip() in ("month", "harvest month", "production month")),
+        None
+    )
     target_options = [
         c for c in get_numeric_columns(df)
         if any(term in c.lower() for term in ("harvest", "production", "yield", "supply", "quantity", "volume"))
     ]
+
     if not year_col or not month_col or not target_options:
         st.warning("Forecasting needs Year, Month, and a numeric harvest/production column. Check your CSV headers.")
     else:
@@ -659,7 +862,7 @@ elif page == "Harvest Forecasting":
                     "Method": method,
                 })
                 st.write(f"Forecast method: **{method}**")
-                st.dataframe(future.round(2), use_container_width=True, hide_index=True)
+                st.dataframe(future.round(2), width="stretch", hide_index=True)
 
                 fig, ax = plt.subplots(figsize=(10, 4))
                 ax.plot(monthly.index, monthly.values, label="Historical")
@@ -681,22 +884,15 @@ elif page == "Downloads":
         data=df.to_csv(index=False).encode("utf-8-sig"),
         file_name="cleaned_coconut_data.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
     )
 
-    quality = pd.DataFrame({
-        "Column": df.columns,
-        "Data type": [str(df[c].dtype) for c in df.columns],
-        "Missing values": [int(df[c].isna().sum()) for c in df.columns],
-        "Missing (%)": [(df[c].isna().mean() * 100).round(2) for c in df.columns],
-        "Unique values": [int(df[c].nunique(dropna=True)) for c in df.columns],
-    })
     st.download_button(
         "Download data quality report (CSV)",
-        data=quality.to_csv(index=False).encode("utf-8-sig"),
+        data=quality_report(df).to_csv(index=False).encode("utf-8-sig"),
         file_name="data_quality_report.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
     )
 
     forecast = st.session_state.get("forecast_download")
@@ -706,7 +902,7 @@ elif page == "Downloads":
             data=forecast.to_csv(index=False).encode("utf-8-sig"),
             file_name="coconut_production_forecast.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
     else:
         st.info("Open Harvest Forecasting and generate a forecast first to enable the forecast download.")
@@ -718,7 +914,7 @@ elif page == "Downloads":
             data=prediction.to_csv(index=False).encode("utf-8-sig"),
             file_name="model_test_predictions.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
     class_prediction_download = st.session_state.get("classification_prediction_download")
@@ -728,8 +924,11 @@ elif page == "Downloads":
             data=class_prediction_download.to_csv(index=False).encode("utf-8-sig"),
             file_name="combination_prediction.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
 st.markdown("---")
-st.caption("Coconut Production Analytics • Uploads are processed by this app for the current session. Model results depend on the quality, quantity, and coverage of the uploaded records.")
+st.caption(
+    "Coconut Production Analytics • Uploads are processed by this app for the current session. "
+    "Model results depend on the quality, quantity, and coverage of the uploaded records."
+)
