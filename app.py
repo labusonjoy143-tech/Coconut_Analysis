@@ -267,7 +267,7 @@ try:
     else:
         raw_data = pd.read_excel(uploaded_file)
 except Exception as exc:
-    st.error(f"Could not read the uploaded dataset: {exc}")
+    st.error(f"Unable to read uploaded dataset: {exc}")
     st.stop()
 
 if raw_data.empty:
