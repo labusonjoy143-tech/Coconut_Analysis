@@ -699,14 +699,18 @@ elif page == "Classification & Prediction":
     else:
         # Automatically choose the most suitable overall production/supply measure.
         # Priority favors explicit supply/production quantity fields over generic harvest fields.
-        target_priority = ("supply", "production", "harvest", "yield", "quantity", "volume")
-        target = min(
-            suggested_targets,
-            key=lambda col: min(
-                (target_priority.index(term) for term in target_priority if term in col.lower()),
-                default=len(target_priority)
-            )
-        )
+        target_priority = ("supply", "production", "harvest (kg)", "harvest", "yield", "quantity", "volume")
+        def target_rank(col):
+            lower = col.lower().strip()
+            rank = min((target_priority.index(term) for term in target_priority if term in lower), default=len(target_priority))
+            # Harvested area is a useful predictor, but not the preferred overall supply outcome
+            # when a harvest quantity column is available.
+            if "area" in lower and any(token in lower for token in ("harvest", "production", "coconut")):
+                rank += 3
+            if any(token in lower for token in ("kg", "ton", "quantity", "volume")):
+                rank -= 1
+            return rank
+        target = min(suggested_targets, key=target_rank)
         st.caption(f"Automatic outcome selected from your data: **{target}**. No outcome-variable selection is required.")
         st.caption(
             "Models use the uploaded dataset only. Results are estimates and do not prove "
@@ -742,9 +746,27 @@ elif page == "Classification & Prediction":
                 st.markdown("### Regression: predict the selected quantity")
                 test_fraction = st.slider("Test dataset proportion", 0.15, 0.40, 0.20, 0.05)
                 try:
-                    X_train, X_test, y_train, y_test = train_test_split(
-                        X, y, test_size=test_fraction, random_state=42
-                    )
+                    year_col_reg = next((c for c in model_data.columns if c.lower().strip() in ("year", "harvest year", "production year")), None)
+                    if year_col_reg:
+                        year_values = pd.to_numeric(model_data.loc[X.index, year_col_reg], errors="coerce")
+                    else:
+                        year_values = pd.Series(np.nan, index=X.index)
+                    if year_values.notna().sum() >= 5 and year_values.nunique(dropna=True) >= 3:
+                        ordered_years = year_values.dropna().sort_values(kind="stable")
+                        unique_years = np.sort(ordered_years.unique())
+                        n_hold_years = max(1, int(np.ceil(len(unique_years) * test_fraction)))
+                        test_year_values = set(unique_years[-n_hold_years:])
+                        test_idx = year_values.index[year_values.isin(test_year_values)]
+                        train_idx = year_values.index[year_values.notna() & ~year_values.isin(test_year_values)]
+                        X_train, X_test, y_train, y_test = X.loc[train_idx], X.loc[test_idx], y.loc[train_idx], y.loc[test_idx]
+                        st.info(f"Regression evaluation uses a chronological holdout: training through {min(test_year_values)-1:g} where possible; testing years {min(test_year_values):g}–{max(test_year_values):g}.")
+                    else:
+                        X_train, X_test, y_train, y_test = train_test_split(
+                            X, y, test_size=test_fraction, random_state=42
+                        )
+                        st.info("Regression evaluation uses a random holdout because a usable Year column was not found.")
+                    if len(X_train) < 5 or len(X_test) < 2:
+                        raise ValueError("Not enough records remain in the training/test split. Reduce the test proportion or provide more historical records.")
                     reg = Pipeline([
                         ("preprocess", make_preprocessor(X_train)),
                         ("model", MLPRegressor(
@@ -827,32 +849,12 @@ elif page == "Classification & Prediction":
                 st.markdown("### Overall Coconut Supply Classification")
                 st.write(
                     "The dashboard automatically classifies the selected production/supply measure "
-                    "into Low, Medium, or High. You do not need to choose a separate classification "
-                    "outcome or manually select input variables. Available non-target fields are used "
-                    "together to evaluate combinations."
+                    "into Low, Medium, or High. It uses eligible non-target fields together and "
+                    "does not use the harvest target itself as an input. If a Year column exists, "
+                    "later years are held out for testing to better simulate prediction of unseen periods."
                 )
                 class_target = target
                 raw_y = pd.to_numeric(model_data[class_target], errors="coerce")
-                valid_numeric = raw_y.notna()
-                y_class = pd.Series(pd.NA, index=model_data.index, dtype="string")
-                if int(valid_numeric.sum()) >= 3 and raw_y.loc[valid_numeric].nunique() >= 2:
-                    # Quantile groups produce relative Low / Medium / High supply classes.
-                    # Rank first so tied values do not cause qcut to collapse bin edges.
-                    try:
-                        ranked = raw_y.loc[valid_numeric].rank(method="first")
-                        binned = pd.qcut(ranked, q=3, labels=["Low", "Medium", "High"])
-                        y_class.loc[valid_numeric] = binned.astype("string")
-                    except (ValueError, TypeError):
-                        try:
-                            ranked = raw_y.loc[valid_numeric].rank(method="first")
-                            binned = pd.qcut(ranked, q=2, labels=["Low", "High"])
-                            y_class.loc[valid_numeric] = binned.astype("string")
-                        except (ValueError, TypeError):
-                            pass
-
-                # Automatically use all usable columns except the classification target and
-                # the target already used by regression. This avoids asking users to choose
-                # a class outcome or individual predictor fields.
                 selected_features = [
                     c for c in model_data.columns
                     if c != class_target
@@ -863,111 +865,117 @@ elif page == "Classification & Prediction":
                         and model_data[c].nunique(dropna=True) > 0.8 * len(model_data)
                     )
                 ]
-                # Prevent direct target leakage if the regression target and class target differ.
-                selected_features = [c for c in selected_features if c != target]
+                # A direct target or obvious target duplicate must never be an input.
+                selected_features = [c for c in selected_features if c != class_target]
+                st.caption(f"Automatic outcome: {class_target} grouped into relative Low / Medium / High supply classes.")
+                st.caption("Class thresholds are learned from the training data only. A 100% score is not guaranteed and is not the goal; reliable evaluation is.")
 
-                st.caption(f"Automatic outcome: {class_target} grouped into Low / Medium / High.")
-                st.caption(
-                    "The model uses all eligible columns in the uploaded data as inputs. "
-                    "Weather, month, or other fields are optional predictors only when present; "
-                    "none is required as the classification outcome."
-                )
-
+                valid = raw_y.notna()
+                X_class = normalize_model_frame(model_data.loc[valid, selected_features]) if selected_features else pd.DataFrame(index=model_data.index[valid])
+                raw_y = raw_y.loc[valid]
                 if not selected_features:
                     st.warning("No usable input variables were found apart from the supply outcome.")
+                elif len(raw_y) < 10 or raw_y.nunique() < 2:
+                    st.warning("There are not enough valid target values to train and evaluate supply classes.")
                 else:
-                    X_class = normalize_model_frame(model_data[selected_features])
-                    valid = y_class.notna()
-                    X_class, y_class = X_class.loc[valid], y_class.loc[valid].astype(str)
-                    counts = y_class.value_counts()
-                    keep = counts[counts >= 2].index
-                    mask = y_class.isin(keep)
-                    X_class, y_class = X_class.loc[mask], y_class.loc[mask]
-
-                    if len(y_class) < 6 or y_class.nunique() < 2:
-                        st.warning(
-                            "There are not enough examples in multiple supply classes to train "
-                            "and evaluate the classifier. Upload more valid records if possible."
-                        )
+                    test_size_cls = st.slider(
+                        "Classification test proportion", .15, .40, .20, .05,
+                        key="classification_test_fraction"
+                    )
+                    # Prefer a year-grouped chronological holdout to avoid same-year leakage.
+                    year_col_cls = next((c for c in model_data.columns if c.lower().strip() in ("year", "harvest year", "production year")), None)
+                    if year_col_cls:
+                        years = pd.to_numeric(model_data.loc[valid, year_col_cls], errors="coerce")
                     else:
-                        test_size_cls = st.slider(
-                            "Classification test proportion", .15, .40, .20, .05,
-                            key="classification_test_fraction"
+                        years = pd.Series(np.nan, index=raw_y.index)
+                    if years.notna().sum() >= 5 and years.nunique(dropna=True) >= 3:
+                        order = years.sort_values(kind="stable").index
+                        ordered_years = years.loc[order]
+                        unique_years = np.sort(ordered_years.dropna().unique())
+                        n_hold_years = max(1, int(np.ceil(len(unique_years) * test_size_cls)))
+                        test_year_values = set(unique_years[-n_hold_years:])
+                        test_idx = ordered_years.index[ordered_years.isin(test_year_values)]
+                        train_idx = ordered_years.index[~ordered_years.isin(test_year_values)]
+                        split_description = f"chronological holdout: train before {min(test_year_values):g}; test years {min(test_year_values):g}–{max(test_year_values):g}"
+                    else:
+                        train_idx, test_idx = train_test_split(
+                            raw_y.index, test_size=test_size_cls, random_state=42
                         )
-                        class_counts = y_class.value_counts()
-                        n_classes = int(y_class.nunique())
-                        n_test = int(np.ceil(len(y_class) * float(test_size_cls)))
-                        n_train = len(y_class) - n_test
-                        can_stratify = (
-                            n_classes >= 2 and int(class_counts.min()) >= 2
-                            and n_test >= n_classes and n_train >= n_classes
-                        )
-                        stratify = y_class if can_stratify else None
-                        try:
-                            Xtr, Xte, ytr, yte = train_test_split(
-                                X_class, y_class, test_size=test_size_cls,
-                                random_state=42, stratify=stratify
-                            )
+                        split_description = "random holdout (no usable Year column was available)"
+
+                    y_train_raw, y_test_raw = raw_y.loc[train_idx], raw_y.loc[test_idx]
+                    # Learn relative class cutoffs from training target only.
+                    q1, q2 = np.quantile(y_train_raw.astype(float), [1/3, 2/3])
+                    internal_edges = sorted(set([float(q1), float(q2)]))
+                    if len(internal_edges) == 2:
+                        bins = [-np.inf, internal_edges[0], internal_edges[1], np.inf]
+                        labels = ["Low", "Medium", "High"]
+                    elif len(internal_edges) == 1:
+                        bins = [-np.inf, internal_edges[0], np.inf]
+                        labels = ["Low", "High"]
+                    else:
+                        bins, labels = None, []
+
+                    if bins is None or y_train_raw.nunique() < 2:
+                        st.warning("The training data cannot form distinct Low/Medium/High classes. More variation in production records is needed.")
+                    else:
+                        ytr = pd.cut(y_train_raw, bins=bins, labels=labels, include_lowest=True).astype(str)
+                        yte = pd.cut(y_test_raw, bins=bins, labels=labels, include_lowest=True).astype(str)
+                        # Remove empty labels produced by a degenerate boundary, if any.
+                        present_train = ytr.value_counts()
+                        keep_classes = present_train[present_train > 0].index.tolist()
+                        train_mask = ytr.isin(keep_classes)
+                        test_mask = yte.isin(keep_classes)
+                        Xtr, ytr = X_class.loc[train_idx].loc[train_mask], ytr.loc[train_mask]
+                        Xte, yte = X_class.loc[test_idx].loc[test_mask], yte.loc[test_mask]
+                        if len(ytr) < 6 or ytr.nunique() < 2 or len(yte) < 1:
+                            st.warning("The chronological training/test split does not contain enough examples across classes for a useful evaluation. Try a smaller test proportion or provide more years of data.")
+                        else:
                             clf = Pipeline([
                                 ("preprocess", make_preprocessor(Xtr)),
                                 ("model", RandomForestClassifier(
-                                    n_estimators=250, random_state=42,
-                                    class_weight="balanced", min_samples_leaf=1, n_jobs=1
+                                    n_estimators=200, random_state=42,
+                                    class_weight="balanced", min_samples_leaf=3,
+                                    max_features="sqrt", n_jobs=1
                                 ))
                             ])
                             clf.fit(Xtr, ytr)
                             yhat = clf.predict(Xte)
+                            st.info(f"Evaluation split: {split_description}. Training records: {len(Xtr)}; held-out records: {len(Xte)}. Thresholds were learned from training records only.")
                             score1, score2 = st.columns(2)
-                            score1.metric("Accuracy", f"{accuracy_score(yte, yhat):.1%}")
+                            score1.metric("Held-out accuracy", f"{accuracy_score(yte, yhat):.1%}")
                             score2.metric("Balanced accuracy", f"{balanced_accuracy_score(yte, yhat):.1%}")
-                            report = pd.DataFrame(
-                                classification_report(yte, yhat, output_dict=True, zero_division=0)
-                            ).T
+                            report = pd.DataFrame(classification_report(yte, yhat, output_dict=True, zero_division=0)).T
                             report.index.name = "Class"
                             st.markdown("#### Classification report")
                             st.dataframe(report.round(4), width="stretch")
                             with st.expander("What do the report columns mean?"):
                                 st.write("**Precision:** how often predictions for a class are correct. **Recall:** how many actual examples of a class were found. **F1-score:** balance between precision and recall. **Support:** number of true test examples in each class.")
-                                st.write("**Macro avg** treats classes equally; **weighted avg** accounts for each class's number of records. These scores depend on dataset size and class distribution.")
+                                st.write("Macro average treats classes equally; weighted average accounts for each class's number of records. Small holdout sets can make metrics unstable.")
 
-                            labels = list(clf.named_steps["model"].classes_)
-                            cm = confusion_matrix(yte, yhat, labels=labels)
-                            fig, ax = plt.subplots(figsize=(max(5, len(labels) * .9), 4.5))
+                            labels_present = [c for c in labels if c in set(yte) | set(yhat)]
+                            cm = confusion_matrix(yte, yhat, labels=labels_present)
+                            fig, ax = plt.subplots(figsize=(max(5, len(labels_present) * .9), 4.5))
                             im = ax.imshow(cm, aspect="auto")
-                            ax.set_xticks(range(len(labels)), labels, rotation=35, ha="right")
-                            ax.set_yticks(range(len(labels)), labels)
+                            ax.set_xticks(range(len(labels_present)), labels_present, rotation=35, ha="right")
+                            ax.set_yticks(range(len(labels_present)), labels_present)
                             ax.set_xlabel("Predicted class")
                             ax.set_ylabel("Actual class")
-                            ax.set_title("Overall coconut supply — confusion matrix")
+                            ax.set_title("Overall coconut supply — chronological holdout confusion matrix")
                             for i in range(cm.shape[0]):
-                                for j in range(cm.shape[1]):
-                                    ax.text(j, i, str(cm[i, j]), ha="center", va="center")
+                                for j in range(cm.shape[1]): ax.text(j, i, str(cm[i, j]), ha="center", va="center")
                             fig.colorbar(im, ax=ax, label="Records")
                             fig.tight_layout()
                             st.pyplot(fig)
                             plt.close(fig)
 
                             try:
-                                perm = permutation_importance(
-                                    clf, Xte, yte, n_repeats=5, random_state=42,
-                                    scoring="f1_weighted", n_jobs=1
-                                )
-                                importance = pd.DataFrame({
-                                    "Variable": selected_features,
-                                    "Importance": perm.importances_mean,
-                                    "Description": [
-                                        f"Model usefulness of {f}; this is not evidence of causation."
-                                        for f in selected_features
-                                    ]
-                                }).sort_values("Importance", ascending=False)
+                                perm = permutation_importance(clf, Xte, yte, n_repeats=3, random_state=42, scoring="f1_weighted", n_jobs=1)
+                                importance = pd.DataFrame({"Variable": Xte.columns, "Importance": perm.importances_mean}).sort_values("Importance", ascending=False)
                                 st.markdown("#### Automatically included input variable importance")
                                 try:
                                     import plotly.express as px
-                                    fig = px.bar(
-                                        importance, x="Importance", y="Variable", orientation="h",
-                                        hover_data={"Description": True, "Importance": ":.4f"},
-                                        title="Which available inputs help classify overall supply?"
-                                    )
+                                    fig = px.bar(importance, x="Importance", y="Variable", orientation="h", title="Which available inputs help classify overall supply?")
                                     st.plotly_chart(fig, width="stretch")
                                 except ImportError:
                                     st.bar_chart(importance.set_index("Variable")["Importance"], horizontal=True)
@@ -976,7 +984,7 @@ elif page == "Classification & Prediction":
                                 st.info(f"Variable importance could not be calculated: {imp_exc}")
 
                             st.markdown("#### Predict overall supply for a new combination")
-                            st.caption("Enter values for the available inputs below. The model returns one overall Low, Medium, or High supply class.")
+                            st.caption("Enter the available inputs below. The classifier returns Low, Medium, or High using the training-period class boundaries.")
                             user_values = {}
                             for feature in selected_features:
                                 series = X_class[feature]
@@ -985,17 +993,11 @@ elif page == "Classification & Prediction":
                                     default = float(vals.median()) if not vals.empty else 0.0
                                     low = float(vals.min()) if not vals.empty else 0.0
                                     high = float(vals.max()) if not vals.empty else 1.0
-                                    if low == high:
-                                        high = low + 1.0
-                                    user_values[feature] = st.number_input(
-                                        feature, min_value=low, max_value=high,
-                                        value=min(max(default, low), high), key=f"overall_combo_{feature}"
-                                    )
+                                    if low == high: high = low + 1.0
+                                    user_values[feature] = st.number_input(feature, min_value=low, max_value=high, value=min(max(default, low), high), key=f"overall_combo_{feature}")
                                 else:
                                     opts = series.dropna().astype(str).value_counts().index.tolist() or ["Unknown"]
-                                    user_values[feature] = st.selectbox(
-                                        feature, opts, key=f"overall_combo_cat_{feature}"
-                                    )
+                                    user_values[feature] = st.selectbox(feature, opts, key=f"overall_combo_cat_{feature}")
 
                             if st.button("Classify overall coconut supply", type="primary"):
                                 one_row = pd.DataFrame([user_values], columns=selected_features)
@@ -1003,20 +1005,9 @@ elif page == "Classification & Prediction":
                                 st.success(f"Overall coconut supply classification: {outcome}")
                                 if hasattr(clf.named_steps["model"], "predict_proba"):
                                     probs = clf.predict_proba(one_row)[0]
-                                    prob_df = pd.DataFrame({
-                                        "Class": clf.named_steps["model"].classes_,
-                                        "Estimated probability": probs
-                                    }).sort_values("Estimated probability", ascending=False)
-                                    st.dataframe(
-                                        prob_df.style.format({"Estimated probability": "{:.1%}"}),
-                                        width="stretch", hide_index=True
-                                    )
-                                st.session_state["classification_prediction_download"] = pd.DataFrame(
-                                    [{**user_values, "Automatic outcome": class_target,
-                                      "Overall supply class": outcome}]
-                                )
-                        except Exception as exc:
-                            st.error(f"Overall supply classification could not run with these data: {exc}")
+                                    prob_df = pd.DataFrame({"Class": clf.named_steps["model"].classes_, "Estimated probability": probs}).sort_values("Estimated probability", ascending=False)
+                                    st.dataframe(prob_df.style.format({"Estimated probability": "{:.1%}"}), width="stretch", hide_index=True)
+                                st.session_state["classification_prediction_download"] = pd.DataFrame([{**user_values, "Automatic outcome": class_target, "Overall supply class": outcome}])
 
 # ---------- Forecasting ----------
 elif page == "Harvest Forecasting":
@@ -1061,7 +1052,48 @@ elif page == "Harvest Forecasting":
             })
             monthly = forecast_data.groupby("Date")[target].sum().sort_index().asfreq("MS")
             missing_months = int(monthly.isna().sum())
+            # Interpolate only within the observed history; show a chronological holdout evaluation.
             monthly = monthly.interpolate(method="time", limit_direction="both")
+
+            st.markdown("#### Forecast model evaluation on unseen months")
+            st.caption("The final months are held out for backtesting. The forecasting model is fitted only on earlier months for this evaluation.")
+            if len(monthly) >= 18:
+                holdout_n = max(3, min(12, int(np.ceil(len(monthly) * 0.20))))
+                train_series = monthly.iloc[:-holdout_n]
+                test_series = monthly.iloc[-holdout_n:]
+                backtest_values = None
+                backtest_method = "Seasonal-naive baseline"
+                if HAS_STATSMODELS and len(train_series) >= 24:
+                    try:
+                        backtest_fit = ExponentialSmoothing(
+                            train_series, trend="add", seasonal="add",
+                            seasonal_periods=12, initialization_method="estimated"
+                        ).fit(optimized=True)
+                        backtest_values = np.asarray(backtest_fit.forecast(len(test_series)), dtype=float)
+                        backtest_method = "Holt-Winters fitted on training period"
+                    except Exception:
+                        backtest_values = None
+                if backtest_values is None:
+                    vals = []
+                    for date in test_series.index:
+                        prior_date = date - pd.DateOffset(months=12)
+                        if prior_date in train_series.index:
+                            vals.append(float(train_series.loc[prior_date]))
+                        else:
+                            vals.append(float(train_series.tail(min(12, len(train_series))).median()))
+                    backtest_values = np.asarray(vals, dtype=float)
+                backtest_values = np.maximum(backtest_values, 0)
+                backtest_mae = mean_absolute_error(test_series.to_numpy(), backtest_values)
+                backtest_rmse = mean_squared_error(test_series.to_numpy(), backtest_values) ** 0.5
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Backtest MAE", f"{backtest_mae:,.3f}")
+                m2.metric("Backtest RMSE", f"{backtest_rmse:,.3f}")
+                m3.metric("Test months", str(len(test_series)))
+                st.caption(f"Backtest method: {backtest_method}. Test period: {test_series.index.min():%b %Y} to {test_series.index.max():%b %Y}. Metrics are in the same units as {target}.")
+                backtest_table = pd.DataFrame({"Date": test_series.index, "Actual": test_series.to_numpy(), "Predicted": backtest_values})
+                st.dataframe(backtest_table.round(2), width="stretch", hide_index=True)
+            else:
+                st.info("At least 18 monthly observations are recommended to display a meaningful held-out backtest.")
 
             st.metric("Monthly observations", f"{len(monthly):,}")
             st.caption(f"Missing calendar months before interpolation: {missing_months}. Interpolation is used for plotting/model continuity and may affect results.")
