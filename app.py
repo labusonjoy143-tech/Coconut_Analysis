@@ -471,7 +471,7 @@ elif page == "Classification & Prediction":
                     reg = Pipeline([
                         ("preprocess", make_preprocessor(X_train)),
                         ("model", RandomForestRegressor(
-                            n_estimators=250, random_state=42, min_samples_leaf=2, n_jobs=-1
+                            n_estimators=100, random_state=42, min_samples_leaf=2, n_jobs=-1
                         )),
                     ])
                     reg.fit(X_train, y_train)
@@ -637,7 +637,7 @@ elif page == "Classification & Prediction":
                                 clf = Pipeline([
                                     ("preprocess", make_preprocessor(Xtr)),
                                     ("model", RandomForestClassifier(
-                                        n_estimators=250, random_state=42,
+                                        n_estimators=100, random_state=42,
                                         class_weight="balanced", min_samples_leaf=1, n_jobs=-1
                                     ))
                                 ])
